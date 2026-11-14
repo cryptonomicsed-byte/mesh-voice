@@ -17,19 +17,25 @@ exactly like the app: crypto_sign(own key) prepended with own public key,
 then crypto_box_seal() to the peer's ed25519->curve25519 key.
 
 Media is standard WebRTC (aiortc). The bot auto-answers — no human taps
-"accept". Phase 2 (not yet wired): STT on the inbound audio track ->
-agent -> TTS on the outbound track. See on_audio_track().
+"accept". Inbound audio runs through agent-voice's pipeline (speech-to-text ->
+card-grounded agent -> text-to-speech) and the reply goes back on an outbound
+audio track. Signalling, keys and the WebRTC session stay Meshenger's; only
+the conversation pipeline is shared.
 
 Usage:
-    mesh_voice.py --bot grok-bot --bind 100.109.5.90 [--port 10001]
+    mesh_voice.py --bot grok-bot --bind 100.109.5.90 --card card.json
+    mesh_voice.py ... --offline      # refuse to start unless everything is local
+    mesh_voice.py ... --no-agent --greeting hello.mp3   # greeting only
 Key: ~/.config/mesh-voice/<bot>.key (created by gen_bot_qr.py)
 """
 
 import argparse
 import asyncio
+import ipaddress
 import json
 import os
 import sys
+from urllib.parse import urlparse
 
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.contrib.media import MediaPlayer
@@ -47,7 +53,11 @@ SERVER_PORT = 10001
 
 
 class VoiceEndpoint:
-    def __init__(self, bot, seed, bind, port, ring_seconds=1.5, greeting=None):
+    def __init__(self, bot, seed, bind, port, ring_seconds=1.5, greeting=None,
+                 pipeline_factory=None):
+        # pipeline_factory(outbound_track) -> a VoicePipeline for one call, or
+        # None for a greeting-only endpoint.
+        self.pipeline_factory = pipeline_factory
         self.bot = bot
         self.seed = seed
         self.own_pub = public_key_from_seed(seed)
@@ -104,8 +114,14 @@ class VoiceEndpoint:
         pc = RTCPeerConnection()
         self.calls.append(pc)
 
-        # greeting: played to the caller when the call connects (v1 voice)
-        if self.greeting and os.path.isfile(self.greeting):
+        pipeline = None
+        if self.pipeline_factory is not None:
+            from agent_voice.pipeline import QueueAudioTrack, pump_audio
+            outbound = QueueAudioTrack()
+            pc.addTrack(outbound)
+            pipeline = self.pipeline_factory(outbound)
+        elif self.greeting and os.path.isfile(self.greeting):
+            # greeting-only endpoint: play the MP3 when the call connects
             try:
                 player = MediaPlayer(self.greeting)
                 if player.audio:
@@ -116,10 +132,16 @@ class VoiceEndpoint:
             except Exception as e:
                 print(f"[{self.bot}] greeting failed: {e}", flush=True)
 
+        greeted = False
+
         @pc.on("track")
         def on_track(track):
             print(f"[{self.bot}] incoming {track.kind} track", flush=True)
-            if track.kind == "audio":
+            if track.kind != "audio":
+                return
+            if pipeline is not None:
+                asyncio.ensure_future(pump_audio(track, pipeline))
+            else:
                 asyncio.ensure_future(self.on_audio_track(track))
 
         @pc.on("datachannel")
@@ -136,7 +158,13 @@ class VoiceEndpoint:
 
         @pc.on("connectionstatechange")
         async def on_connectionstatechange():
+            nonlocal greeted
             print(f"[{self.bot}] webrtc {pc.connectionState}", flush=True)
+            # Greet only once media is actually up; audio queued before the
+            # transport connects is never heard.
+            if pc.connectionState == "connected" and pipeline is not None and not greeted:
+                greeted = True
+                asyncio.ensure_future(pipeline.greet())
             if pc.connectionState in ("closed", "failed"):
                 if pc in self.calls:
                     self.calls.remove(pc)
@@ -177,7 +205,7 @@ class VoiceEndpoint:
             pass
 
     async def on_audio_track(self, track):
-        """Phase 2 hook: STT -> agent -> TTS. For now, consume and count."""
+        """Greeting-only mode: drain the caller's audio (nothing listens to it)."""
         frames = 0
         try:
             while True:
@@ -190,14 +218,85 @@ class VoiceEndpoint:
             print(f"[{self.bot}] audio track ended after {frames} frames ({e})", flush=True)
 
 
+def _is_local_host(host: str) -> bool:
+    if host in ("localhost", ""):
+        return host == "localhost"
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_private or ip.is_link_local
+
+
+def offline_problems(backend: str, env=os.environ) -> list[str]:
+    """Why this configuration would need the internet. Empty list = fully local.
+
+    A LAN call only works without internet if speech-to-text, the model and
+    text-to-speech all run locally; this is checked before the bot starts so
+    an "offline" bot never silently depends on a cloud service.
+    """
+    problems = []
+    if backend != "generic":
+        problems.append(f"agent backend '{backend}' is not a local model; use "
+                        "--agent-backend generic with LLM_BASE_URL on this machine or LAN")
+    else:
+        host = urlparse(env.get("LLM_BASE_URL", "")).hostname or ""
+        if not _is_local_host(host):
+            problems.append(f"LLM_BASE_URL host '{host}' is not on this machine or LAN")
+    voice = env.get("AGENT_VOICE_PIPER_VOICE", "/opt/agent-voice/voices/en_US-lessac-medium.onnx")
+    if not os.path.isfile(voice):
+        problems.append(f"no local Piper voice at {voice} (set AGENT_VOICE_PIPER_VOICE)")
+    return problems
+
+
+def build_pipeline_factory(bot, card_path, backend, offline):
+    """Return a per-call VoicePipeline factory, or exit with what is missing."""
+    try:
+        from agent_voice.__main__ import _load_card
+        from agent_voice.pipeline import Transcriber, VoicePipeline
+    except ImportError as e:
+        sys.exit(f"agent-voice is required for conversation ({e}). Install it, or "
+                 "run with --no-agent for a greeting-only endpoint.")
+    card = _load_card(card_path) if card_path else None
+    if offline:
+        problems = offline_problems(backend)
+        if problems:
+            sys.exit("--offline refused; this setup needs the internet:\n  - "
+                     + "\n  - ".join(problems))
+        os.environ["AGENT_VOICE_TTS"] = "piper"      # no cloud TTS fallback
+        try:
+            Transcriber()._load()                    # the STT model must already be on disk
+        except Exception as e:
+            sys.exit(f"--offline refused; speech-to-text model is not available locally: {e}")
+
+    def factory(outbound):
+        return VoicePipeline(bot, outbound, agent_backend=backend, card=card)
+
+    try:                                             # fail at boot, not on the first call
+        from agent_voice.pipeline import QueueAudioTrack
+        factory(QueueAudioTrack())
+    except Exception as e:
+        sys.exit(f"voice pipeline cannot start: {e}")
+    return factory
+
+
 def main():
     ap = argparse.ArgumentParser(description="Meshenger-compatible voice endpoint for a bot")
     ap.add_argument("--bot", required=True)
     ap.add_argument("--bind", required=True, help="IP to listen on (bot's tailnet IP)")
     ap.add_argument("--port", type=int, default=SERVER_PORT)
     ap.add_argument("--ring-seconds", type=float, default=1.5)
+    ap.add_argument("--card", default=None,
+                    help="business card.json to ground the agent on")
+    ap.add_argument("--agent-backend", default=os.environ.get("MESH_VOICE_AGENT_BACKEND", "generic"),
+                    choices=["generic", "deepseek"],
+                    help="generic = any OpenAI-compatible server (LLM_BASE_URL, LLM_API_KEY, LLM_MODEL)")
+    ap.add_argument("--offline", action="store_true",
+                    help="refuse to start unless STT, the model and TTS are all local")
+    ap.add_argument("--no-agent", action="store_true",
+                    help="greeting-only endpoint: no conversation")
     ap.add_argument("--greeting", default=None,
-                    help="MP3 played to the caller on connect (v1 voice)")
+                    help="MP3 played on connect (only with --no-agent)")
     ap.add_argument("--key-hex", default=None,
                     help="ed25519 seed as hex (overrides the key file; handy for deploy)")
     args = ap.parse_args()
@@ -219,8 +318,15 @@ def main():
         if len(seed) != 32:
             sys.exit("bad key file (expected 32-byte seed)")
 
+    factory = None
+    if not args.no_agent:
+        factory = build_pipeline_factory(args.bot, args.card, args.agent_backend, args.offline)
+    print(f"[{args.bot}] mode: "
+          + ("greeting only" if factory is None else
+             f"conversation ({args.agent_backend}{', offline-checked' if args.offline else ''})"),
+          flush=True)
     ep = VoiceEndpoint(args.bot, seed, args.bind, args.port,
-                       args.ring_seconds, args.greeting)
+                       args.ring_seconds, args.greeting, pipeline_factory=factory)
     try:
         asyncio.run(ep.run())
     except KeyboardInterrupt:
