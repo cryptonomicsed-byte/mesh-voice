@@ -27,30 +27,48 @@ comes up, the user's audio arrives on an `audio` track, hangup arrives on the
 - `gen_bot_qr.py` — per-bot keypair + QR (`qr/<bot>.png`)
 - `mesh_crypto.py` — Meshenger signaling crypto + framing (mirrors `Crypto.kt`, `PacketReader`/`PacketWriter`)
 - `mesh_voice.py` — the endpoint: `--bot grok-bot --bind <tailnet-ip> [--port 10001]`
-- `test_phone.py` — simulated Meshenger caller (aiortc + same crypto) for testing
+- `test_phone.py` — simulated Meshenger caller (aiortc + same crypto) for a deployed bot
+- `test_conversation.py` — automated loopback conversation test
 - `venv/` — Python env (qrcode, pillow, pynacl, aiortc)
+
+## Conversation
+
+Inbound audio runs through agent-voice's pipeline: speech-to-text, the
+card-grounded agent, text-to-speech, and the reply on an outbound audio track.
+Signalling, the Ed25519 identity and the WebRTC session stay Meshenger's own;
+only the conversation pipeline is shared, so a business has one agent whether
+it is called over Nostr or over the LAN.
+
+```bash
+pip install pynacl aiortc qrcode pillow
+pip install -e ../agent-voice            # the shared pipeline
+export LLM_BASE_URL=http://127.0.0.1:11434/v1 LLM_API_KEY=local LLM_MODEL=<model>
+python mesh_voice.py --bot <id> --bind <ip> --card /etc/helix/companies/<slug>/card.json
+```
+
+`--offline` refuses to start unless everything is local: the model server is on
+this machine or the LAN, a Piper voice file is present, and the speech-to-text
+model is already on disk. It prints each thing that would need the internet.
+Without `--offline` the bot may use cloud services and must not be described
+as working without internet.
+
+`--no-agent --greeting hello.mp3` keeps the old greeting-only behaviour.
 
 ## Verified
 
-- Full signaling handshake against the simulated caller: TCP connect →
-  sealed `{"action":"call","offer"}` → `ringing` → `connected`+answer, with
-  ed25519 mutual authentication (caller key checked on both ends). PASS.
+- `python -m pytest -q`: a simulated phone places a real call on loopback
+  (sealed-box signalling over TCP, WebRTC media via aiortc), speaks, and hears
+  the agent's reply. Speech models are faked in the test; signalling, media,
+  utterance segmentation, the agent turn and the outbound track are the real
+  code.
 - QR payload validated against the app's parser rules (`Contact.fromJSON`,
   `isValidName`, hex handling).
 
-## Honest gaps
+## Not yet verified
 
-- **WebRTC media couldn't be tested in this sandbox** — it blocks UDP, and
-  aiortc's ICE is UDP-only here. The offer/answer exchange itself works; on a
-  normal host (e.g. grokbot-box) ICE will complete over the tailnet. Verify on
-  deploy with a real Meshenger call.
-- **Voice pipeline not yet built**: inbound audio → STT → agent → TTS →
-  outbound audio track. The hook is `VoiceEndpoint.on_audio_track()`. TTS
-  exists (`/opt/hatch/bin/tts`); STT needs a pick (faster-whisper); the agent
-  brain needs a choice (DeepSeek is already wired via vault for HelixMain).
-- **Deploy blocked**: needs the Tailscale tunnel approval for grokbot-box
-  (still not surfacing). When it opens: copy `mesh_voice.py`,
-  `mesh_crypto.py`, the key, and run with `--bind 100.109.5.90`.
+- A call from the real Meshenger Android app.
+- A call with real speech models, and a fully offline call on real hardware
+  (which model sizes a given machine can run in real time is untested).
 
 ## Add a bot
 
